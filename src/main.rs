@@ -3,6 +3,7 @@ use egui::util::cache;
 use ordered_float::OrderedFloat;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::Vec2;
 
@@ -41,6 +42,13 @@ struct CCDisplay {
     window_title: Option<String>,
     ctrl_c: Arc<AtomicBool>,
     display_size_cache: cache::FrameCache<Vec2, DisplaySizeComputer>,
+    hover_state: HoverState,
+}
+
+enum HoverState {
+    NotHovering,
+    StartedHovering(Instant),
+    Hidden,
 }
 
 const TEXTURE_FILTER: egui::TextureFilter = egui::TextureFilter::Linear;
@@ -66,6 +74,7 @@ impl CCDisplay {
             window_title: args.window_title,
             ctrl_c,
             display_size_cache: Default::default(),
+            hover_state: HoverState::NotHovering,
         }
     }
 }
@@ -74,7 +83,7 @@ impl eframe::App for CCDisplay {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // do the texture rendering right away and everything else after. idk how
         // egui works but maybe this reduces latency?
-        egui::CentralPanel::default()
+        let response = egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let window_size = frame.info().window_info.size;
@@ -87,8 +96,24 @@ impl eframe::App for CCDisplay {
         if let Some(title) = self.window_title.take() {
             frame.set_window_title(&title);
         }
-        if self.ctrl_c.load(Relaxed) {
+        if self.ctrl_c.load(Relaxed) || ctx.input().key_pressed(egui::Key::Escape) {
             frame.close();
+        }
+        match self.hover_state {
+            HoverState::NotHovering => {
+                if response.response.hovered() && ctx.input().pointer.is_still() {
+                    self.hover_state = HoverState::StartedHovering(Instant::now());
+                }
+            }
+            _ if !response.response.hovered() || ctx.input().pointer.is_moving() => {
+                self.hover_state = HoverState::NotHovering
+            }
+            HoverState::StartedHovering(inst) => {
+                if inst.elapsed() >= Duration::from_secs(3) {
+                    self.hover_state = HoverState::Hidden
+                }
+            }
+            HoverState::Hidden => ctx.output().cursor_icon = egui::CursorIcon::None,
         }
     }
 }
