@@ -1,10 +1,14 @@
 use std::cmp;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering::{Acquire, Release},
+};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use egui::Color32;
+use rusb::UsbContext;
 
 #[derive(Clone)]
 pub struct CameraActor {
@@ -36,13 +40,51 @@ const FORMAT_PREFERENCES: &[fn(uvc::StreamFormat, uvc::StreamFormat) -> cmp::Ord
 
 impl CameraActor {
     pub fn run(mut self) {
-        let ctx = uvc::Context::new().expect("couldn't create context");
-        std::thread::spawn(move || loop {
-            if let Err(e) = self.go(&ctx) {
-                eprintln!("error!! {e}");
-                self.set_texture(egui::ColorImage::example())
+        std::thread::spawn(move || {
+            let usb_ctx = rusb::Context::new().expect("couldn't create context");
+            let ctx = uvc::Context::from_usb_ctx(&usb_ctx).expect("couldn't create context");
+
+            let conn_flag = Arc::new(AtomicBool::new(false));
+
+            let mut hotplug = rusb::HotplugBuilder::new();
+            hotplug.enumerate(true);
+            if let Some(vid) = self.vendor_id {
+                hotplug.vendor_id(vid as u16);
             }
-            std::thread::sleep(Duration::from_millis(500));
+            if let Some(pid) = self.product_id {
+                hotplug.product_id(pid as u16);
+            }
+            struct Hotplug {
+                conn_flag: Arc<AtomicBool>,
+            }
+            impl rusb::Hotplug<rusb::Context> for Hotplug {
+                fn device_arrived(&mut self, _: rusb::Device<rusb::Context>) {
+                    self.conn_flag.store(true, Release);
+                }
+
+                fn device_left(&mut self, _: rusb::Device<rusb::Context>) {
+                    self.conn_flag.store(false, Release);
+                }
+            }
+            let callback = Hotplug {
+                conn_flag: conn_flag.clone(),
+            };
+            let _reg = hotplug
+                .register(&usb_ctx, Box::new(callback))
+                .expect("register failed");
+
+            loop {
+                if let Err(e) = poll_until(&usb_ctx, &conn_flag, true) {
+                    eprintln!("{e}");
+                    return;
+                }
+                let res = self.go(&ctx, &usb_ctx, &conn_flag);
+                self.set_texture(egui::ColorImage::example());
+                if let Err(e) = res {
+                    eprintln!("error!! {e}");
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
         });
     }
 
@@ -51,7 +93,12 @@ impl CameraActor {
         self.ctx.request_repaint();
     }
 
-    fn go(&self, ctx: &uvc::Context) -> anyhow::Result<()> {
+    fn go(
+        &self,
+        ctx: &uvc::Context,
+        usb_ctx: &rusb::Context,
+        conn_flag: &AtomicBool,
+    ) -> anyhow::Result<()> {
         let device = ctx.find_device(
             self.vendor_id,
             self.product_id,
@@ -83,30 +130,14 @@ impl CameraActor {
 
         let mut streamh = devh.get_stream_handle_with_format(format)?;
 
-        let counter = Arc::new(AtomicU64::new(0));
-        let counter2 = counter.clone();
-        let stream = streamh.start_stream(
-            move |frame, actor| {
-                counter2.fetch_add(1, Relaxed);
-                actor.handle_frame(frame)
-            },
-            self.clone(),
-        )?;
+        let mut actor = self.clone();
+        let stream = streamh.start_stream(move |frame| actor.handle_frame(frame))?;
 
-        let mut cache = counter.load(Relaxed);
-        loop {
-            std::thread::sleep(Duration::from_millis(100));
-            let prev = cache;
-            cache = counter.load(Relaxed);
-            if prev == cache {
-                if let Err(uvc::Error::NoDevice) = devh.exposure_abs() {
-                    stream.stop();
-                    // aborts if we try to drop devicehandle while the device is disconnected
-                    std::mem::forget(devh);
-                    return Ok(());
-                }
-            }
-        }
+        poll_until(usb_ctx, conn_flag, false)?;
+        stream.stop();
+        // aborts if we try to drop devicehandle while the device is disconnected
+        std::mem::forget(devh);
+        Ok(())
     }
 
     fn handle_frame(&mut self, frame: &uvc::Frame) {
@@ -128,5 +159,16 @@ impl CameraActor {
             pixels: rgba,
             size: [width, height],
         });
+    }
+}
+
+fn poll_until(usb_ctx: &rusb::Context, flag: &AtomicBool, v: bool) -> anyhow::Result<()> {
+    loop {
+        if flag.load(Acquire) == v {
+            return Ok(());
+        }
+        usb_ctx
+            .handle_events(None)
+            .context("failed to handle events")?;
     }
 }

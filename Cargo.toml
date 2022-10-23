@@ -8,8 +8,8 @@ name = "ccdisplay"
 path = "src/main.rs"
 
 [dependencies]
-uvc = "0.2"
-# uvc = { path = "../../libuvc-rs" }
+# uvc = "0.2"
+uvc = { path = "../../libuvc-rs", features = ["rusb"] }
 anyhow = "1"
 egui = "0.19"
 eframe = "0.19"
@@ -19,6 +19,7 @@ flume = { version = "0.10.14", default-features = false, features = ["async"] }
 ctrlc = "3.2.3"
 ordered-float = "3.2.0"
 futures-util = { version = "0.3.24", default-features = false, features = ["async-await-macro"] }
+rusb = "0.9.1"
 
 [dependencies.pulse]
 package = "libpulse-binding"
