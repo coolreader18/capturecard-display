@@ -83,10 +83,11 @@ impl eframe::App for CCDisplay {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // do the texture rendering right away and everything else after. idk how
         // egui works but maybe this reduces latency?
+        let window_info = frame.info().window_info;
         let response = egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                let window_size = frame.info().window_info.size;
+                let window_size = window_info.size;
                 let texture_size = self.texture.size_vec2();
                 let display_size = self
                     .display_size_cache
@@ -98,6 +99,9 @@ impl eframe::App for CCDisplay {
         }
         if self.ctrl_c.load(Relaxed) || ctx.input().key_pressed(egui::Key::Escape) {
             frame.close();
+        }
+        if ctx.input().key_pressed(egui::Key::F) {
+            frame.set_fullscreen(!window_info.fullscreen);
         }
         match self.hover_state {
             HoverState::NotHovering => {

@@ -93,7 +93,9 @@ async fn find_and_load_module(
     let mod_id = load_module(
         introspect,
         "module-loopback",
-        &format!("source={index} source_dont_move=true"),
+        &format!(
+            r#"source={index} source_dont_move=true sink_input_properties="media.name=Splatooon media.software=ccdisplay""#
+        ),
     )
     .await;
 
