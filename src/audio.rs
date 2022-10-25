@@ -6,23 +6,27 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
-use futures_util::{FutureExt, Stream, StreamExt};
+use futures_util::{stream::FusedStream, FutureExt, StreamExt};
 use pulse::context::{self, introspect};
 use pulse::error::PAErr;
 use pulse::mainloop::standard::Mainloop;
 use pulse::mainloop::{self, api::Mainloop as _};
 
-pub fn audio_loop(done_ch: (flume::Sender<()>, flume::Receiver<()>)) {
+pub fn audio_loop(
+    done_ch: (flume::Sender<()>, flume::Receiver<()>),
+    mut audname: String,
+    audname_rx: flume::Receiver<String>,
+) {
     let rt = PaRuntime::new();
     let mut ctx = rt.make_context("meeee");
     rt.run(async move {
-        connect(&mut ctx, None, pulse::context::FlagSet::NOFLAGS, None).await?;
+        connect(&mut ctx).await?;
         let mut events = subscribe(&mut ctx, context::subscribe::InterestMaskSet::SOURCE);
         let mut module_id = None;
         let module_loop = async {
             loop {
                 let source_index = loop {
-                    match find_and_load_module(&mut ctx.introspect()).await {
+                    match find_and_load_module(&mut ctx.introspect(), audname.clone()).await {
                         Ok(Some((mod_id, idx))) => {
                             module_id = Some(mod_id);
                             break Some(idx);
@@ -34,7 +38,21 @@ pub fn audio_loop(done_ch: (flume::Sender<()>, flume::Receiver<()>)) {
                     }
                 };
                 loop {
-                    let (_facility, op, index) = events.next().await.unwrap();
+                    let ev = futures_util::select_biased! {
+                        new_src = audname_rx.recv_async() => {
+                            match new_src {
+                                Ok(new) if new == audname => continue,
+                                Err(_) => continue,
+                                Ok(new) => audname = new,
+                            }
+                            if let Some(mod_id) = module_id.take() {
+                                unload_module(&mut ctx.introspect(), mod_id).await;
+                            }
+                            break;
+                        }
+                        ev = events.next() => ev.unwrap(),
+                    };
+                    let (_facility, op, index) = ev;
                     match op {
                         context::subscribe::Operation::New if source_index.is_none() => break,
                         context::subscribe::Operation::Removed if Some(index) == source_index => {
@@ -68,21 +86,14 @@ pub fn audio_loop(done_ch: (flume::Sender<()>, flume::Receiver<()>)) {
 
 async fn find_and_load_module(
     introspect: &mut introspect::Introspector,
+    audname: String,
 ) -> anyhow::Result<Option<(u32, u32)>> {
-    let source_info = get_source_info_list(introspect, |info| {
-        let form_factor = info.proplist.get("device.form_factor").map(|b| {
-            if let Some((b'\0', s)) = b.split_last() {
-                s
-            } else {
-                b
-            }
-        });
-        // TODO: better way of linking video input with audio input
-        (form_factor == Some(b"webcam"))
-            .then(|| (info.name.as_deref().map(|x| x.to_owned()), info.index))
+    let source_info = get_source_info_list(introspect, move |info| {
+        let name = info.name.as_deref()?;
+        (name == audname).then(|| info.index)
     })
     .await;
-    let (_name, index) = match source_info.into_iter().next() {
+    let index = match source_info.into_iter().next() {
         Some(x) => x,
         None => {
             eprintln!("couldn't find suitable audio device");
@@ -94,7 +105,7 @@ async fn find_and_load_module(
         introspect,
         "module-loopback",
         &format!(
-            r#"source={index} source_dont_move=true sink_input_properties="media.name=Splatooon media.software=ccdisplay""#
+            r#"source={index} source_dont_move=true sink_input_properties="media.software=ccdisplay""#
         ),
     )
     .await;
@@ -102,7 +113,11 @@ async fn find_and_load_module(
     Ok(Some((mod_id, index)))
 }
 
-async fn connect(
+pub(crate) async fn connect(ctx: &mut context::Context) -> Result<(), PAErr> {
+    connect_ex(ctx, None, context::FlagSet::NOFLAGS, None).await
+}
+
+pub(crate) async fn connect_ex(
     ctx: &mut context::Context,
     server: Option<&str>,
     flags: context::FlagSet,
@@ -127,7 +142,7 @@ async fn connect(
     .await
 }
 
-async fn get_source_info_list<
+pub async fn get_source_info_list<
     F: FnMut(&introspect::SourceInfo) -> Option<U> + 'static,
     U: 'static,
 >(
@@ -157,7 +172,7 @@ async fn get_source_info_list<
 fn subscribe(
     ctx: &mut context::Context,
     mask: context::subscribe::InterestMaskSet,
-) -> impl Stream<
+) -> impl FusedStream<
     Item = (
         context::subscribe::Facility,
         context::subscribe::Operation,

@@ -31,7 +31,6 @@ const TEXTURE_FILTER: egui::TextureFilter = egui::TextureFilter::Linear;
 struct DeviceId {
     vendor_id: Option<u16>,
     product_id: Option<u16>,
-    serial_number: Option<String>,
 }
 
 impl CCDisplay {
@@ -46,12 +45,14 @@ impl CCDisplay {
             texture: texture.clone(),
             ctx: cc.egui_ctx.clone(),
             devid_rx,
-            devid: settings.deviceid().unwrap_or_default(),
+            devid: settings.devid.clone(),
         });
 
         let (done_tx, done_rx) = flume::bounded(0);
         let (finished_tx, finished_rx) = flume::bounded(0);
-        std::thread::spawn(|| audio::audio_loop((finished_tx, done_rx)));
+        let (audname_tx, audname_rx) = flume::bounded(4);
+        let audname = settings.audname.clone();
+        std::thread::spawn(|| audio::audio_loop((finished_tx, done_rx), audname, audname_rx));
 
         let ctrl_c = Arc::new(AtomicBool::new(false));
         let flag = ctrl_c.clone();
@@ -65,7 +66,7 @@ impl CCDisplay {
             texture,
             ctrl_c,
             display_size_cache: Default::default(),
-            settings: settings::SettingsWindow::new(settings, devid_tx),
+            settings: settings::SettingsWindow::new(settings, devid_tx, audname_tx),
             done_tx,
             finished_rx,
         }

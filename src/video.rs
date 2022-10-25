@@ -20,6 +20,7 @@ struct CameraActor {
     devid_rx: flume::Receiver<DeviceId>,
     devid: DeviceId,
     usb_ctx: rusb::Context,
+    plug_reg: Option<rusb::Registration<rusb::Context>>,
     conn_tx: flume::Sender<UsbUpdate>,
     conn_rx: flume::Receiver<UsbUpdate>,
 }
@@ -34,6 +35,7 @@ pub(crate) fn run(args: CameraParams) {
         devid_rx: args.devid_rx,
         devid: args.devid,
         usb_ctx: rusb::Context::new().expect("couldn't create context"),
+        plug_reg: None,
         conn_tx,
         conn_rx,
     }
@@ -71,7 +73,7 @@ impl CameraActor {
             let usb_ctx = self.usb_ctx.clone();
             let ctx = uvc::Context::from_usb_ctx(&usb_ctx).expect("couldn't create context");
 
-            let mut reg = self.hotplug();
+            self.hotplug();
 
             let usb_ctx = self.usb_ctx.clone();
             std::thread::spawn(move || loop {
@@ -81,26 +83,19 @@ impl CameraActor {
             });
 
             loop {
-                while self.conn_rx.recv().unwrap() != UsbUpdate::Connected {}
+                while !matches!(self.poll_chan(), PollChanRes::Plug(UsbUpdate::Connected)) {}
                 let res = self.go(&ctx);
                 self.texture.set_texture(egui::ColorImage::example());
-                match res {
-                    Ok(switch_dev) => {
-                        if switch_dev {
-                            drop(reg);
-                            reg = self.hotplug();
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error!! {e}");
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
+                if let Err(e) = res {
+                    eprintln!("error!! {e}");
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             }
         });
     }
 
-    fn hotplug(&self) -> rusb::Registration<rusb::Context> {
+    fn hotplug(&mut self) {
+        self.plug_reg = None;
         let mut hotplug = rusb::HotplugBuilder::new();
         hotplug.enumerate(true);
         if let Some(vid) = self.devid.vendor_id {
@@ -124,16 +119,18 @@ impl CameraActor {
         let callback = Box::new(Hotplug {
             tx: self.conn_tx.clone(),
         });
-        hotplug
-            .register(&self.usb_ctx, callback)
-            .expect("register failed")
+        self.plug_reg = Some(
+            hotplug
+                .register(&self.usb_ctx, callback)
+                .expect("register failed"),
+        )
     }
 
-    fn go(&mut self, ctx: &uvc::Context) -> anyhow::Result<bool> {
+    fn go(&mut self, ctx: &uvc::Context) -> anyhow::Result<()> {
         let device = ctx.find_device(
             self.devid.vendor_id.map(Into::into),
             self.devid.product_id.map(Into::into),
-            self.devid.serial_number.as_deref(),
+            None,
         )?;
 
         let devh = device.open()?;
@@ -165,35 +162,53 @@ impl CameraActor {
         let stream = streamh.start_stream(move |frame| texture.handle_frame(frame))?;
 
         loop {
+            let forget_dev = match self.poll_chan() {
+                PollChanRes::Plug(UsbUpdate::Connected) => continue,
+                PollChanRes::Plug(UsbUpdate::Disconnected) => true,
+                PollChanRes::DevSwitch => false,
+            };
+            stream.stop();
+            if forget_dev {
+                // aborts if we try to drop devicehandle while the device is disconnected
+                std::mem::forget(devh);
+            }
+            return Ok(());
+        }
+    }
+
+    fn poll_chan(&mut self) -> PollChanRes {
+        loop {
             let res = flume::Selector::new()
                 .recv(&self.conn_rx, |upd| {
-                    if upd.unwrap() == UsbUpdate::Disconnected {
-                        ControlFlow::Break((true, false))
-                    } else {
-                        ControlFlow::Continue(())
-                    }
+                    ControlFlow::Break(PollChanRes::Plug(upd.unwrap()))
                 })
                 .recv(&self.devid_rx, |devid| {
                     if let Ok(devid) = devid {
                         let switch = devid != self.devid;
-                        self.devid = devid;
-                        ControlFlow::Break((false, switch))
+                        if switch {
+                            self.devid = devid;
+                            ControlFlow::Break(PollChanRes::DevSwitch)
+                        } else {
+                            ControlFlow::Continue(())
+                        }
                     } else {
                         // the process is gonna end really soon anyway
                         ControlFlow::Continue(())
                     }
                 })
                 .wait();
-            if let ControlFlow::Break((forget_dev, switch_dev)) = res {
-                stream.stop();
-                if forget_dev {
-                    // aborts if we try to drop devicehandle while the device is disconnected
-                    std::mem::forget(devh);
+            if let ControlFlow::Break(x) = res {
+                if let PollChanRes::DevSwitch = x {
+                    self.hotplug();
                 }
-                return Ok(switch_dev);
+                return x;
             }
         }
     }
+}
+enum PollChanRes {
+    Plug(UsbUpdate),
+    DevSwitch,
 }
 
 #[derive(Clone)]
