@@ -1,80 +1,73 @@
-use clap::Parser;
-use egui::util::cache;
-use ordered_float::OrderedFloat;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use egui::Vec2;
+use egui::{util::cache, Vec2};
+use ordered_float::OrderedFloat;
 
 mod audio;
+mod settings;
 mod video;
 
-#[derive(Parser)]
-struct Args {
-    #[clap(long)]
-    window_title: Option<String>,
-    #[clap(long)]
-    vendor_id: Option<i32>,
-    #[clap(long)]
-    product_id: Option<i32>,
-    #[clap(long)]
-    serial_number: Option<String>,
-}
-
 fn main() {
-    let args = Args::parse();
-    let (done_tx, done_rx) = flume::bounded(0);
-    let (finished_tx, finished_rx) = flume::bounded(0);
-    let done_ch = (finished_tx, done_rx);
-    std::thread::spawn(|| audio::audio_loop(done_ch));
     eframe::run_native(
         "CCDisplay",
         Default::default(),
-        Box::new(|cc| Box::new(CCDisplay::new(cc, args))),
+        Box::new(|cc| Box::new(CCDisplay::new(cc))),
     );
-    let _ = done_tx.send(());
-    let _ = finished_rx.recv();
 }
 
 struct CCDisplay {
     texture: egui::TextureHandle,
-    window_title: Option<String>,
     ctrl_c: Arc<AtomicBool>,
     display_size_cache: cache::FrameCache<Vec2, DisplaySizeComputer>,
-    hover_state: HoverState,
-}
-
-enum HoverState {
-    NotHovering,
-    StartedHovering(Instant),
-    Hidden,
+    settings: settings::SettingsWindow,
+    done_tx: flume::Sender<()>,
+    finished_rx: flume::Receiver<()>,
 }
 
 const TEXTURE_FILTER: egui::TextureFilter = egui::TextureFilter::Linear;
 
+#[derive(Clone, Default, PartialEq, Eq)]
+struct DeviceId {
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
+    serial_number: Option<String>,
+}
+
 impl CCDisplay {
-    fn new(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let texture =
             cc.egui_ctx
                 .load_texture("display", egui::ColorImage::example(), TEXTURE_FILTER);
-        video::CameraActor {
+        let settings = settings::Settings::from_storage(cc.storage.unwrap());
+        let (devid_tx, devid_rx) = flume::bounded(4);
+
+        video::run(video::CameraParams {
             texture: texture.clone(),
             ctx: cc.egui_ctx.clone(),
-            vendor_id: args.vendor_id,
-            product_id: args.product_id,
-            serial_number: args.serial_number,
-        }
-        .run();
+            devid_rx,
+            devid: settings.deviceid().unwrap_or_default(),
+        });
+
+        let (done_tx, done_rx) = flume::bounded(0);
+        let (finished_tx, finished_rx) = flume::bounded(0);
+        std::thread::spawn(|| audio::audio_loop((finished_tx, done_rx)));
+
         let ctrl_c = Arc::new(AtomicBool::new(false));
         let flag = ctrl_c.clone();
-        let _ = ctrlc::set_handler(move || flag.store(true, Relaxed));
+        let ctx = cc.egui_ctx.clone();
+        let _ = ctrlc::set_handler(move || {
+            flag.store(true, Relaxed);
+            ctx.request_repaint();
+        });
+
         Self {
             texture,
-            window_title: args.window_title,
             ctrl_c,
             display_size_cache: Default::default(),
-            hover_state: HoverState::NotHovering,
+            settings: settings::SettingsWindow::new(settings, devid_tx),
+            done_tx,
+            finished_rx,
         }
     }
 }
@@ -92,33 +85,34 @@ impl eframe::App for CCDisplay {
                 let display_size = self
                     .display_size_cache
                     .get((window_size.into(), texture_size.into()));
-                ui.add(egui::Image::new(self.texture.id(), display_size))
+                ui.add(egui::Image::new(self.texture.id(), display_size));
             });
-        if let Some(title) = self.window_title.take() {
-            frame.set_window_title(&title);
-        }
-        if self.ctrl_c.load(Relaxed) || ctx.input().key_pressed(egui::Key::Escape) {
+        if self.ctrl_c.load(Relaxed) {
             frame.close();
         }
-        if ctx.input().key_pressed(egui::Key::F) {
-            frame.set_fullscreen(!window_info.fullscreen);
+        if !self.settings.open {
+            let input = ctx.input();
+            if input.key_pressed(egui::Key::Escape) {
+                frame.close();
+            }
+            if input.key_pressed(egui::Key::F) {
+                frame.set_fullscreen(!window_info.fullscreen);
+            }
         }
-        match self.hover_state {
-            HoverState::NotHovering => {
-                if response.response.hovered() && ctx.input().pointer.is_still() {
-                    self.hover_state = HoverState::StartedHovering(Instant::now());
-                }
-            }
-            _ if !response.response.hovered() || ctx.input().pointer.is_moving() => {
-                self.hover_state = HoverState::NotHovering
-            }
-            HoverState::StartedHovering(inst) => {
-                if inst.elapsed() >= Duration::from_secs(3) {
-                    self.hover_state = HoverState::Hidden
-                }
-            }
-            HoverState::Hidden => ctx.output().cursor_icon = egui::CursorIcon::None,
+        let hide_cursor = ctx.animate_bool_with_time(
+            egui::Id::new("pointerhover"),
+            response.response.hovered() && ctx.input().pointer.is_still(),
+            3.0,
+        );
+        if hide_cursor == 1.0 {
+            ctx.output().cursor_icon = egui::CursorIcon::None;
         }
+        self.settings.update(ctx, frame);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.done_tx.send(());
+        let _ = self.finished_rx.recv();
     }
 }
 

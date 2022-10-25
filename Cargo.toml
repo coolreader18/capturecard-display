@@ -12,10 +12,9 @@ path = "src/main.rs"
 uvc = { path = "../../libuvc-rs", features = ["rusb"] }
 anyhow = "1"
 egui = "0.19"
-eframe = "0.19"
-clap = { version = "4.0.12", features = ["derive"] }
+eframe = { version = "0.19", features = ["persistence"] }
 os_pipe = { version = "1.1.1", features = ["io_safety"] }
-flume = { version = "0.10.14", default-features = false, features = ["async"] }
+flume = { version = "0.10.14", default-features = false, features = ["async", "select"] }
 ctrlc = "3.2.3"
 ordered-float = "3.2.0"
 futures-util = { version = "0.3.24", default-features = false, features = ["async-await-macro"] }
