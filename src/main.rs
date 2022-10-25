@@ -35,6 +35,13 @@ struct DeviceId {
 
 impl CCDisplay {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut style = cc.egui_ctx.style();
+        std::sync::Arc::make_mut(&mut style)
+            .text_styles
+            .values_mut()
+            .for_each(|f| f.size += 10.0);
+        cc.egui_ctx.set_style(style);
+
         let texture =
             cc.egui_ctx
                 .load_texture("display", egui::ColorImage::example(), TEXTURE_FILTER);
