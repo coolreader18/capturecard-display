@@ -5,7 +5,7 @@ use crate::DeviceId;
 pub(crate) struct Settings {
     window_title: String,
     pub devid: DeviceId,
-    selected_vid_name: String,
+    vidname: String,
     pub audname: String,
 }
 impl Settings {
@@ -26,7 +26,7 @@ impl Settings {
                 .get_string("ccdisplay.windowtitle")
                 .unwrap_or_else(|| "CCDisplay".to_owned()),
             devid: devid().unwrap_or_default(),
-            selected_vid_name: storage.get_string("ccdisplay.vidname").unwrap_or_default(),
+            vidname: storage.get_string("ccdisplay.vidname").unwrap_or_default(),
             audname: storage.get_string("ccdisplay.audname").unwrap_or_default(),
         }
     }
@@ -35,7 +35,7 @@ impl Settings {
         storage.set_string("ccdisplay.windowtitle", self.window_title.clone());
         storage.set_string("ccdisplay.pid", s(self.devid.product_id));
         storage.set_string("ccdisplay.vid", s(self.devid.vendor_id));
-        storage.set_string("ccdisplay.vidname", self.selected_vid_name.clone());
+        storage.set_string("ccdisplay.vidname", self.vidname.clone());
         storage.set_string("ccdisplay.audname", self.audname.clone());
     }
 }
@@ -95,6 +95,7 @@ impl SettingsWindow {
         egui::Window::new("Settings")
             .open(&mut self.open)
             .collapsible(false)
+            .auto_sized()
             .show(ctx, |ui| {
                 let settings = &mut self.settings;
                 ui.horizontal(|ui| {
@@ -114,24 +115,14 @@ impl SettingsWindow {
                         .unwrap_or(usize::MAX);
                     (list, i)
                 });
-                let vidname = |i| {
-                    if i == usize::MAX {
-                        settings.selected_vid_name.clone()
-                    } else {
-                        let x: &uvc::DeviceDescription = &vidlist[i];
-                        format!(
-                            "{} {}",
-                            x.manufacturer.as_deref().unwrap_or(""),
-                            x.product.as_deref().unwrap_or("")
-                        )
-                    }
+                let vidname = |x: &uvc::DeviceDescription| {
+                    format!(
+                        "{} {}",
+                        x.manufacturer.as_deref().unwrap_or(""),
+                        x.product.as_deref().unwrap_or("")
+                    )
                 };
-                ui.horizontal(|ui| {
-                    ui.label("Video source");
-                    egui::ComboBox::from_id_source(ui.id().with("vidlist"))
-                        .selected_text(vidname(*v_i))
-                        .show_index(ui, v_i, vidlist.len(), vidname);
-                });
+                source_dropdown(ui, "Video source", vidlist, v_i, &settings.vidname, vidname);
                 let (audlist, a_i) = self.audio_list.get_or_insert_with(|| {
                     let list = {
                         let rt = super::audio::PaRuntime::new();
@@ -154,19 +145,8 @@ impl SettingsWindow {
                         .unwrap_or(usize::MAX);
                     (list, i)
                 });
-                let audname = |i| {
-                    if i == usize::MAX {
-                        settings.audname.clone()
-                    } else {
-                        let x: &AudioDescr = &audlist[i];
-                        x.desc.clone().unwrap_or_else(|| x.name.clone())
-                    }
-                };
-                ui.horizontal(|ui| {
-                    ui.label("Audio source");
-                    egui::ComboBox::from_id_source(ui.id().with("audlist"))
-                        .selected_text(audname(*a_i))
-                        .show_index(ui, a_i, audlist.len(), audname);
+                source_dropdown(ui, "Audio source", audlist, a_i, &settings.audname, |x| {
+                    x.desc.clone().unwrap_or_else(|| x.name.clone())
                 });
                 // let product_id = settings.product_id.show(ui, "Product ID");
                 // let vendor_id = settings.vendor_id.show(ui, "Vendor ID");
@@ -176,8 +156,8 @@ impl SettingsWindow {
                 // });
                 if ui.button("Save").clicked() {
                     if *v_i != usize::MAX {
-                        settings.selected_vid_name = vidname(*v_i);
                         let dev = &vidlist[*v_i];
+                        settings.vidname = vidname(dev);
                         settings.devid = DeviceId {
                             vendor_id: Some(dev.vendor_id),
                             product_id: Some(dev.product_id),
@@ -201,6 +181,61 @@ impl SettingsWindow {
             self.audio_list = None;
         }
     }
+}
+
+fn source_dropdown<T>(
+    ui: &mut egui::Ui,
+    label: &str,
+    list: &[T],
+    i: &mut usize,
+    fallback: &str,
+    display: impl Fn(&T) -> String,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+
+        let get = |i| {
+            if i == usize::MAX {
+                fallback.to_owned()
+            } else {
+                display(&list[i])
+            }
+        };
+        let boxx = egui::ComboBox::from_id_source(egui::Id::new("srclist").with(label))
+            .width(160.0)
+            .selected_text({
+                let mut text = get(*i);
+
+                let mut charlen = 0usize;
+                let char40 = text.char_indices().inspect(|_| charlen += 1).nth(40);
+                if let Some((char40, _)) = char40 {
+                    text.drain(char40..);
+                    text.push('…');
+                } else {
+                    text.extend(std::iter::repeat(' ').take(40usize - charlen));
+                }
+                text
+            });
+        // based off ComboBox::show_index
+
+        let selected = i;
+        let mut changed = false;
+
+        let mut response = boxx
+            .show_ui(ui, |ui| {
+                for i in 0..list.len() {
+                    if ui.selectable_label(i == *selected, get(i)).clicked() {
+                        *selected = i;
+                        changed = true;
+                    }
+                }
+            })
+            .response;
+
+        if changed {
+            response.mark_changed();
+        }
+    });
 }
 
 // struct SettingStringField<T: FromStr> {
