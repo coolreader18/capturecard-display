@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=CCDisplay
+Comment=Turn your capture card into a monitor
+Exec=ccdisplay
+Type=Application
+Categories=Game;AudioVideo
